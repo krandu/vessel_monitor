@@ -1,7 +1,7 @@
 {
-  "in_port": true,
+  "in_port": false,
   "last_notified_arrival": "2026-07-20T23:43:19.028704",
-  "last_packet_time": "2026-07-20 09:22:51 UTC",
+  "last_packet_time": "2026-07-20 10:13:54 UTC",
   "last_lat": 22.18228,
-  "last_lon": 113.43139
+  "last_lon": 113.43138
 }
