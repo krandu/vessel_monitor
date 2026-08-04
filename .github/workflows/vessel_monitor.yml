@@ -2,7 +2,12 @@ name: Vessel Monitor
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    # 北京时间 08:00（UTC 00:00），上午上班前，使用船讯网 API
+    - cron: '0 0 * * 1-5'
+    # 北京时间 14:00（UTC 06:00），下午上班前，使用船讯网 API
+    - cron: '0 6 * * 1-5'
+    # 工作日其余时段每小时运行，跳过船讯网（节省免费额度）
+    - cron: '0 1-5,7-23 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -20,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests websocket-client
+        run: pip install requests
 
       - name: Restore vessel state
         uses: actions/cache@v4.2.0
@@ -30,11 +35,22 @@ jobs:
           restore-keys: |
             vessel-state-
 
-      - name: Run monitor
+      - name: Run monitor (08:00/14:00 BJT, with Shipxy)
+        if: github.event.schedule == '0 0 * * 1-5' || github.event.schedule == '0 6 * * 1-5' || github.event_name == 'workflow_dispatch'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
+          SHIPXY_API_KEY: ${{ secrets.SHIPXY_API_KEY }}
+          VESSELAPI_KEY: ${{ secrets.VESSELAPI_KEY }}
+        run: python vessel_monitor.py
+
+      - name: Run monitor (hourly, skip Shipxy)
+        if: github.event.schedule == '0 1-5,7-23 * * 1-5'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SHIPXY_API_KEY: ""
+          VESSELAPI_KEY: ${{ secrets.VESSELAPI_KEY }}
         run: python vessel_monitor.py
 
       - name: Save vessel state
