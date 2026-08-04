@@ -4,16 +4,18 @@
 MMSI: 412536814 | 目标港口: 洪湾渔港 (22.178°N, 113.437°E)
 
 数据源策略:
-  1. aisstream.io WebSocket（实时，等待最多 WEBSOCKET_TIMEOUT 秒）
-     [需配置 AISSTREAM_API_KEY，注册: https://aisstream.io]
+  1. 船讯网 API（shipxy.com，中国近海最佳，需 SHIPXY_API_KEY）
+  2. vesselapi.com REST API（实时，免费150次/月，按 MMSI 查询）
+     [需配置 VESSELAPI_KEY，注册: https://dashboard.vesselapi.com]
   2. shipinfo.net API / 网页（降级，接受 ≤ SHIPINFO_MAX_AGE_HOURS 的数据）
 
 防重推机制（方向A）:
   shipinfo 延迟高达14+小时，用 last_ais_timestamp 记录上次推送时用的 AIS 时间戳，
   只有时间戳比上次新才触发通知，避免同一条数据重复推送。
 
-aisstream 等待延长（方向B）:
-  WEBSOCKET_TIMEOUT = 360秒（6分钟），覆盖港口静止船 AIS 发射间隔。
+vesselapi 调用策略:
+  仅在需要时调用（shipinfo 也失败时），节省免费额度（150次/月）。
+  实际用量远低于上限，因为 shipinfo 在船停靠期间通常能提供够用的数据。
 """
 
 import os, json, math, time, re, logging, threading
@@ -26,15 +28,15 @@ VESSEL_NAME       = "粤珠渔养20003"
 PORT_LAT          = 22.178
 PORT_LON          = 113.437
 PORT_NAME         = "洪湾渔港"
-ARRIVE_DIST_KM       = 1.5    # 距港 ≤1.5km 判定为靠港
-ARRIVE_SPEED_KNT     = 1.0    # 船速 ≤1节 判定为靠港
-WEBSOCKET_TIMEOUT    = 360    # aisstream.io 等待秒数（方向B：6分钟，覆盖港口静止船AIS发射间隔）
+ARRIVE_DIST_KM         = 1.5  # 距港 ≤1.5km 判定为靠港
+ARRIVE_SPEED_KNT       = 1.0  # 船速 ≤1节 判定为靠港
 SHIPINFO_MAX_AGE_HOURS = 20   # shipinfo降级数据最大接受年龄（方向A：放宽至20小时）
 STATE_FILE        = "vessel_state.json"
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-AISSTREAM_KEY     = os.environ.get("AISSTREAM_API_KEY", "")
+VESSELAPI_KEY     = os.environ.get("VESSELAPI_KEY", "")
+SHIPXY_KEY        = os.environ.get("SHIPXY_API_KEY", "")   # 船讯网免费试用 key
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,7 +115,7 @@ def parse_ais_timestamp(ts_raw) -> datetime | None:
 def is_data_fresh(pos: dict) -> bool:
     """
     检查 AIS 数据是否足够新鲜。
-    - aisstream 数据：实时，直接接受（但仍做基本检查）
+    - vesselapi 数据：实时REST API，直接接受（但仍做基本检查）
     - shipinfo 数据：延迟高，使用宽松阈值 SHIPINFO_MAX_AGE_HOURS（方向A）
     """
     ts = parse_ais_timestamp(pos.get("timestamp"))
@@ -125,8 +127,8 @@ def is_data_fresh(pos: dict) -> bool:
 
     # 根据数据源选择不同阈值
     source = pos.get("source", "")
-    if source == "aisstream":
-        max_age = 1  # 实时数据，超过1小时说明有问题
+    if source in ("vesselapi", "shipxy"):
+        max_age = 2  # 实时REST API，超过2小时说明有问题
     else:
         max_age = SHIPINFO_MAX_AGE_HOURS  # shipinfo 允许最多20小时延迟
 
@@ -147,8 +149,8 @@ def is_newer_than_last(pos: dict, state: dict) -> bool:
     只有时间戳推进了才说明位置真的更新了，才允许触发通知。
     返回 True 表示允许推送，False 表示时间戳未推进，跳过。
     """
-    # aisstream 实时数据不需要此检查
-    if pos.get("source") == "aisstream":
+    # 实时数据源不需要时间戳去重检查
+    if pos.get("source") in ("vesselapi", "shipxy"):
         return True
 
     current_ts = parse_ais_timestamp(pos.get("timestamp"))
@@ -176,81 +178,110 @@ def is_newer_than_last(pos: dict, state: dict) -> bool:
              current_ts.strftime("%Y-%m-%d %H:%M"))
     return True
 
-# ─── 数据源 1: aisstream.io WebSocket（实时）─────────────────────────────────
-def fetch_aisstream() -> dict | None:
+# ─── 数据源 1: 船讯网 API（最优先，中国近海覆盖最佳）─────────────────────────
+def fetch_shipxy() -> dict | None:
     """
-    连接 aisstream.io WebSocket，订阅指定 MMSI，等待第一条 PositionReport 消息。
-    需要环境变量 AISSTREAM_API_KEY。
-    注册地址: https://aisstream.io（免费，注册即得 API key）
+    船讯网单船位置查询接口，专注中国近海，AIS 数据延迟最低。
+    接口: GET https://api.shipxy.com/apicall/v3/GetSingleShip?key=KEY&mmsi=MMSI
+    返回字段: lat, lng, sog, last_time（北京时间字符串）, last_time_utc（Unix时间戳）
+    注册试用: https://api.shipxy.com（免费试用权限）
+    需要环境变量 SHIPXY_API_KEY。
     """
-    if not AISSTREAM_KEY:
-        log.info("[aisstream] 未配置 AISSTREAM_API_KEY，跳过")
+    if not SHIPXY_KEY:
+        log.info("[shipxy] 未配置 SHIPXY_API_KEY，跳过")
         return None
 
+    url = "https://api.shipxy.com/apicall/v3/GetSingleShip"
     try:
-        import websocket  # websocket-client
-    except ImportError:
-        log.warning("[aisstream] websocket-client 未安装，跳过")
+        r = requests.get(url, params={"key": SHIPXY_KEY, "mmsi": MMSI}, timeout=15)
+        log.info("[shipxy] HTTP %s", r.status_code)
+        if r.status_code != 200:
+            log.warning("[shipxy] HTTP 错误 %s", r.status_code)
+            return None
+
+        data = r.json()
+        status = data.get("status", -1)
+
+        # status 含义: 0=成功, 其他=错误（见文档附录「服务码返回说明」）
+        if status != 0:
+            log.warning("[shipxy] 返回错误码 status=%s msg=%s", status, data.get("msg", ""))
+            return None
+
+        d = data.get("data", {})
+        lat = d.get("lat")
+        lon = d.get("lng")
+        spd = d.get("sog") or 0
+
+        # last_time_utc 是 Unix 时间戳（秒），直接用；last_time 是北京时间字符串
+        ts_unix = d.get("last_time_utc")
+        if ts_unix:
+            from datetime import timezone
+            ts = datetime.fromtimestamp(int(ts_unix), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            ts = d.get("last_time")  # fallback: "2025-04-28 16:05:48" 北京时间（UTC+8）
+
+        if lat is None or lon is None:
+            log.warning("[shipxy] 响应中无坐标，完整响应: %s", json.dumps(data, ensure_ascii=False)[:500])
+            return None
+
+        log.info("[shipxy] lat=%.5f lon=%.5f spd=%.1f ts=%s", lat, lon, spd, ts)
+        return {"lat": float(lat), "lon": float(lon), "speed": float(spd),
+                "timestamp": ts, "source": "shipxy"}
+
+    except Exception as e:
+        log.warning("[shipxy] 异常: %s", e)
         return None
 
-    result = {}
-    done = threading.Event()
+# ─── 数据源 1: vesselapi.com REST API（实时）────────────────────────────────
+def fetch_vesselapi() -> dict | None:
+    """
+    vesselapi.com 免费 REST API，按 MMSI 查询最新位置。
+    免费额度: 150次/月（仅在 shipinfo 失败时调用，实际用量远低于上限）
+    注册: https://dashboard.vesselapi.com（无需信用卡）
+    需要环境变量 VESSELAPI_KEY。
+    """
+    if not VESSELAPI_KEY:
+        log.info("[vesselapi] 未配置 VESSELAPI_KEY，跳过")
+        return None
 
-    def on_open(ws):
-        sub = {
-            "APIKey": AISSTREAM_KEY,
-            "MessageTypes": ["PositionReport"],
-            "Filters": {"ShipMMSI": [MMSI]}
-        }
-        ws.send(json.dumps(sub))
-        log.info("[aisstream] 已连接，等待 MMSI %s 的位置消息（最多 %ds）...", MMSI, WEBSOCKET_TIMEOUT)
+    url = f"https://api.vesselapi.com/v1/vessel/{MMSI}/position"
+    try:
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {VESSELAPI_KEY}"},
+            params={"filter.idType": "mmsi"},
+            timeout=15
+        )
+        log.info("[vesselapi] HTTP %s", r.status_code)
 
-    def on_message(ws, message):
-        try:
-            data = json.loads(message)
-            msg_type = data.get("MessageType", "")
-            if msg_type == "PositionReport":
-                pr = data["Message"]["PositionReport"]
-                meta = data.get("MetaData", {})
-                lat = pr.get("Latitude")
-                lon = pr.get("Longitude")
-                spd = pr.get("Sog", 0)          # Speed Over Ground
-                ts  = meta.get("time_utc") or meta.get("TimeReceived")
-                if lat is not None and lon is not None:
-                    result.update({
-                        "lat": float(lat), "lon": float(lon),
-                        "speed": float(spd), "timestamp": ts,
-                        "source": "aisstream"
-                    })
-                    log.info("[aisstream] 收到位置: lat=%.4f lon=%.4f spd=%.1f ts=%s",
-                             lat, lon, spd, ts)
-                    done.set()
-                    ws.close()
-        except Exception as e:
-            log.warning("[aisstream] 消息解析错误: %s", e)
+        if r.status_code == 404:
+            log.warning("[vesselapi] 该船 MMSI 无近80小时内位置记录（船可能关闭AIS或超出覆盖范围）")
+            return None
+        if r.status_code == 429:
+            log.warning("[vesselapi] 请求频率超限（免费额度已用完？）")
+            return None
+        if r.status_code != 200:
+            log.warning("[vesselapi] 非预期状态码 %s，响应: %s", r.status_code, r.text[:300])
+            return None
 
-    def on_error(ws, error):
-        log.warning("[aisstream] WebSocket 错误: %s", error)
-        done.set()
+        data = r.json()
+        # 响应字段: latitude, longitude, sog, timestamp (ISO UTC), vessel_name
+        lat = data.get("latitude")
+        lon = data.get("longitude")
+        spd = data.get("sog") or 0
+        ts  = data.get("timestamp")   # "2026-01-15T12:30:00Z" 格式
 
-    def on_close(ws, *args):
-        done.set()
+        if lat is None or lon is None:
+            log.warning("[vesselapi] 响应中无坐标，完整响应: %s", json.dumps(data)[:500])
+            return None
 
-    ws = websocket.WebSocketApp(
-        "wss://stream.aisstream.io/v0/stream",
-        on_open=on_open, on_message=on_message,
-        on_error=on_error, on_close=on_close
-    )
-    t = threading.Thread(target=ws.run_forever, daemon=True)
-    t.start()
-    done.wait(timeout=WEBSOCKET_TIMEOUT)
-    ws.close()
+        log.info("[vesselapi] lat=%.5f lon=%.5f spd=%.1f ts=%s", lat, lon, spd, ts)
+        return {"lat": float(lat), "lon": float(lon), "speed": float(spd),
+                "timestamp": ts, "source": "vesselapi"}
 
-    if result:
-        log.info("[aisstream] HTTP 成功")
-        return result
-    log.info("[aisstream] 超时（%ds内未收到该船位置报告）", WEBSOCKET_TIMEOUT)
-    return None
+    except Exception as e:
+        log.warning("[vesselapi] 异常: %s", e)
+        return None
 
 # ─── 数据源 2: shipinfo.net API ───────────────────────────────────────────────
 def fetch_shipinfo_api() -> dict | None:
@@ -343,9 +374,10 @@ def fetch_shipinfo_web() -> dict | None:
 
 # ─── 主逻辑 ───────────────────────────────────────────────────────────────────
 SOURCES = [
-    ("aisstream",    fetch_aisstream),
-    ("shipinfo_api", fetch_shipinfo_api),
-    ("shipinfo_web", fetch_shipinfo_web),
+    ("shipxy",       fetch_shipxy),       # 第一：船讯网，中国近海覆盖最佳
+    ("vesselapi",    fetch_vesselapi),    # 第二：vesselapi，国际平台
+    ("shipinfo_api", fetch_shipinfo_api), # 第三：shipinfo API（允许20h延迟）
+    ("shipinfo_web", fetch_shipinfo_web), # 第四：shipinfo 网页（兜底）
 ]
 
 def get_vessel_position() -> dict | None:
@@ -356,7 +388,7 @@ def get_vessel_position() -> dict | None:
             log.info("❌ [%s] 无数据", name)
             time.sleep(1)
             continue
-        # 严格校验时间戳新鲜度（aisstream 数据实时，也做检查）
+        # 严格校验时间戳新鲜度（vesselapi 实时，shipinfo 用宽松阈值）
         if not is_data_fresh(pos):
             log.warning("❌ [%s] 数据过期，丢弃，尝试下一个数据源", name)
             time.sleep(1)
@@ -380,7 +412,7 @@ def main():
     log.info("=" * 60)
     log.info("开始监控 %s (MMSI: %s)", VESSEL_NAME, MMSI)
     log.info("运行时间: %s", now_str)
-    log.info("aisstream等待: %ds | shipinfo最大接受延迟: %dh", WEBSOCKET_TIMEOUT, SHIPINFO_MAX_AGE_HOURS)
+    log.info("shipinfo最大接受延迟: %dh | vesselapi: %s", SHIPINFO_MAX_AGE_HOURS, "已配置" if VESSELAPI_KEY else "未配置")
     log.info("=" * 60)
 
     pos = get_vessel_position()
