@@ -9,7 +9,7 @@ MMSI: 412536814 | 目标港口: 洪湾渔港 (22.178°N, 113.437°E)
   关键保护: AIS 时间戳超过 MAX_DATA_AGE_HOURS 的数据一律丢弃
 """
 
-import os, json, math, time, re, logging, asyncio
+import os, json, math, time, re, logging, threading
 import requests
 from datetime import datetime, timezone, timedelta
 
@@ -182,7 +182,6 @@ def fetch_aisstream() -> dict | None:
     def on_close(ws, *args):
         done.set()
 
-    import threading
     ws = websocket.WebSocketApp(
         "wss://stream.aisstream.io/v0/stream",
         on_open=on_open, on_message=on_message,
