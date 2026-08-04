@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-粤珠渔养20003 靠港监控脚本 v2
+粤珠渔养20003 靠港监控脚本 v3
 MMSI: 412536814 | 目标港口: 洪湾渔港 (22.178°N, 113.437°E)
 
 数据源策略:
-  1. aisstream.io WebSocket（实时，秒级延迟）[需配置 AISSTREAM_API_KEY]
-  2. shipinfo.net（降级，仅接受 ≤2小时内的数据）
-  关键保护: AIS 时间戳超过 MAX_DATA_AGE_HOURS 的数据一律丢弃
+  1. aisstream.io WebSocket（实时，等待最多 WEBSOCKET_TIMEOUT 秒）
+     [需配置 AISSTREAM_API_KEY，注册: https://aisstream.io]
+  2. shipinfo.net API / 网页（降级，接受 ≤ SHIPINFO_MAX_AGE_HOURS 的数据）
+
+防重推机制（方向A）:
+  shipinfo 延迟高达14+小时，用 last_ais_timestamp 记录上次推送时用的 AIS 时间戳，
+  只有时间戳比上次新才触发通知，避免同一条数据重复推送。
+
+aisstream 等待延长（方向B）:
+  WEBSOCKET_TIMEOUT = 360秒（6分钟），覆盖港口静止船 AIS 发射间隔。
 """
 
 import os, json, math, time, re, logging, threading
@@ -19,10 +26,10 @@ VESSEL_NAME       = "粤珠渔养20003"
 PORT_LAT          = 22.178
 PORT_LON          = 113.437
 PORT_NAME         = "洪湾渔港"
-ARRIVE_DIST_KM    = 1.5       # 距港 ≤1.5km
-ARRIVE_SPEED_KNT  = 1.0       # 船速 ≤1节
-MAX_DATA_AGE_HOURS = 2        # AIS数据超过此时长视为过期，拒绝使用
-WEBSOCKET_TIMEOUT = 90        # aisstream.io 等待秒数（近海渔船AIS间隔可能较长）
+ARRIVE_DIST_KM       = 1.5    # 距港 ≤1.5km 判定为靠港
+ARRIVE_SPEED_KNT     = 1.0    # 船速 ≤1节 判定为靠港
+WEBSOCKET_TIMEOUT    = 360    # aisstream.io 等待秒数（方向B：6分钟，覆盖港口静止船AIS发射间隔）
+SHIPINFO_MAX_AGE_HOURS = 20   # shipinfo降级数据最大接受年龄（方向A：放宽至20小时）
 STATE_FILE        = "vessel_state.json"
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -104,22 +111,69 @@ def parse_ais_timestamp(ts_raw) -> datetime | None:
     return None
 
 def is_data_fresh(pos: dict) -> bool:
-    """检查 AIS 数据是否足够新鲜（≤ MAX_DATA_AGE_HOURS 小时）"""
+    """
+    检查 AIS 数据是否足够新鲜。
+    - aisstream 数据：实时，直接接受（但仍做基本检查）
+    - shipinfo 数据：延迟高，使用宽松阈值 SHIPINFO_MAX_AGE_HOURS（方向A）
+    """
     ts = parse_ais_timestamp(pos.get("timestamp"))
     if ts is None:
-        # 没有时间戳，无法判断新鲜度，保守拒绝
         log.warning("数据缺少时间戳，无法验证新鲜度，丢弃")
         return False
     now = datetime.now(timezone.utc)
-    age = now - ts
-    age_h = age.total_seconds() / 3600
-    if age_h > MAX_DATA_AGE_HOURS:
+    age_h = (now - ts).total_seconds() / 3600
+
+    # 根据数据源选择不同阈值
+    source = pos.get("source", "")
+    if source == "aisstream":
+        max_age = 1  # 实时数据，超过1小时说明有问题
+    else:
+        max_age = SHIPINFO_MAX_AGE_HOURS  # shipinfo 允许最多20小时延迟
+
+    if age_h > max_age:
         log.warning(
-            "⚠️  AIS 数据过期！时间戳: %s UTC，已过去 %.1f 小时（阈值: %d 小时），丢弃",
-            ts.strftime("%Y-%m-%d %H:%M"), age_h, MAX_DATA_AGE_HOURS
+            "⚠️  AIS 数据过期！来源: %s，时间戳: %s UTC，已过去 %.1f 小时（阈值: %d 小时），丢弃",
+            source, ts.strftime("%Y-%m-%d %H:%M"), age_h, max_age
         )
         return False
-    log.info("✅ 数据新鲜度: %.0f 分钟前", age.total_seconds() / 60)
+    log.info("✅ 数据新鲜度: %.0f 分钟前（来源: %s）", age_h * 60, source)
+    return True
+
+
+def is_newer_than_last(pos: dict, state: dict) -> bool:
+    """
+    方向A 防重推：检查当前数据的 AIS 时间戳是否比上次推送时更新。
+    shipinfo 延迟高，同一条数据可能在多次检查中都满足条件，
+    只有时间戳推进了才说明位置真的更新了，才允许触发通知。
+    返回 True 表示允许推送，False 表示时间戳未推进，跳过。
+    """
+    # aisstream 实时数据不需要此检查
+    if pos.get("source") == "aisstream":
+        return True
+
+    current_ts = parse_ais_timestamp(pos.get("timestamp"))
+    if current_ts is None:
+        return True  # 没有时间戳，保守允许推送
+
+    last_ts_raw = state.get("last_ais_timestamp")
+    if not last_ts_raw:
+        return True  # 首次没有记录，允许
+
+    last_ts = parse_ais_timestamp(last_ts_raw)
+    if last_ts is None:
+        return True
+
+    if current_ts <= last_ts:
+        log.info(
+            "⏭️  shipinfo 数据时间戳未推进（当前: %s，上次推送: %s），跳过",
+            current_ts.strftime("%Y-%m-%d %H:%M"),
+            last_ts.strftime("%Y-%m-%d %H:%M")
+        )
+        return False
+
+    log.info("🆕 时间戳推进: %s → %s",
+             last_ts.strftime("%Y-%m-%d %H:%M"),
+             current_ts.strftime("%Y-%m-%d %H:%M"))
     return True
 
 # ─── 数据源 1: aisstream.io WebSocket（实时）─────────────────────────────────
@@ -207,15 +261,21 @@ def fetch_shipinfo_api() -> dict | None:
         if r.status_code != 200:
             return None
         data = r.json()
-        vessel = data.get("data") or data.get("vessel") or data
-        lat = vessel.get("lat") or vessel.get("LATITUDE") or vessel.get("latitude")
-        lon = vessel.get("lon") or vessel.get("LONGITUDE") or vessel.get("longitude")
-        spd = vessel.get("speed") or vessel.get("SPEED") or vessel.get("sog") or 0
-        ts  = vessel.get("timestamp") or vessel.get("TIMESTAMP") or vessel.get("time")
+        log.debug("[shipinfo API] 完整响应: %s", json.dumps(data, ensure_ascii=False)[:1200])
+
+        # 实际响应结构: data.latest.{lat, lng, speed_kn, updated}
+        latest = data.get("data", {}).get("latest") or {}
+        lat = latest.get("lat")
+        lon = latest.get("lng") or latest.get("lon")   # shipinfo 用 lng 不是 lon
+        spd = latest.get("speed_kn") or latest.get("speed") or 0
+        ts  = latest.get("updated")                    # "2026-08-03 12:46:12" 格式
+
         if lat is None or lon is None:
-            log.warning("[shipinfo API] 未找到坐标，完整响应: %s",
-                        json.dumps(data, ensure_ascii=False)[:800])
+            log.warning("[shipinfo API] data.latest 中未找到坐标，完整响应: %s",
+                        json.dumps(data, ensure_ascii=False)[:1000])
             return None
+
+        log.info("[shipinfo API] lat=%.5f lon=%.5f spd=%.1f ts=%s", lat, lon, spd, ts)
         return {"lat": float(lat), "lon": float(lon), "speed": float(spd),
                 "timestamp": ts, "source": "shipinfo_api"}
     except Exception as e:
@@ -246,17 +306,36 @@ def fetch_shipinfo_web() -> dict | None:
             log.warning("[shipinfo web] 未找到坐标，片段:\n%s", text[:1500])
             return None
         spd = 0.0
-        m_s = re.search(r'"speed"\s*:\s*([\d.]+)', text, re.IGNORECASE)
+        m_s = re.search(r'SOG\s+([\d.]+)\s*kn', text, re.IGNORECASE)
         if m_s:
             spd = float(m_s.group(1))
-        # 提取时间戳
+
+        # 时间戳：优先匹配页面正文中的 "Latest AIS update: YYYY-MM-DD HH:MM:SS UTC"
+        # 这是最可靠的字段，直接对应免费位置的时间
         ts = None
-        for pat_ts in [r'"timestamp"\s*:\s*"([^"]+)"', r'"time"\s*:\s*"([^"]+)"',
-                       r'"lastUpdate"\s*:\s*"([^"]+)"', r'"updated"\s*:\s*"([^"]+)"']:
-            m_t = re.search(pat_ts, text, re.IGNORECASE)
-            if m_t:
-                ts = m_t.group(1)
-                break
+        m_ts = re.search(
+            r'Latest AIS update[:\s]+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*UTC',
+            text, re.IGNORECASE
+        )
+        if m_ts:
+            ts = m_ts.group(1)  # "2026-08-03 11:43:14"
+            log.info("[shipinfo web] 时间戳(Latest AIS update): %s", ts)
+        else:
+            # 降级：匹配页面内嵌 JSON 中与坐标同块的 updated 字段
+            # 用坐标附近的文本窗口，避免抓到无关的 updated
+            coord_str = f"{lat:.4f}"
+            idx = text.find(coord_str)
+            if idx > 0:
+                window = text[max(0, idx-200):idx+500]
+                m_ts2 = re.search(r'"updated"\s*:\s*"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"',
+                                   window)
+                if m_ts2:
+                    ts = m_ts2.group(1)
+                    log.info("[shipinfo web] 时间戳(JSON updated): %s", ts)
+
+        if ts is None:
+            log.warning("[shipinfo web] 未能提取时间戳，数据将被新鲜度检查丢弃")
+
         return {"lat": lat, "lon": lon, "speed": spd, "timestamp": ts, "source": "shipinfo_web"}
     except Exception as e:
         log.warning("[shipinfo web] 异常: %s", e)
@@ -301,7 +380,7 @@ def main():
     log.info("=" * 60)
     log.info("开始监控 %s (MMSI: %s)", VESSEL_NAME, MMSI)
     log.info("运行时间: %s", now_str)
-    log.info("AIS数据有效期阈值: %d 小时", MAX_DATA_AGE_HOURS)
+    log.info("aisstream等待: %ds | shipinfo最大接受延迟: %dh", WEBSOCKET_TIMEOUT, SHIPINFO_MAX_AGE_HOURS)
     log.info("=" * 60)
 
     pos = get_vessel_position()
@@ -344,6 +423,14 @@ def main():
 
     ais_age = format_age(pos.get("timestamp"))
 
+    # 方向A 防重推：shipinfo 数据时间戳没有推进则跳过
+    if not is_newer_than_last(pos, state):
+        state["last_update"] = now_str
+        state["status"] = now_s
+        save_state(state)
+        log.info("状态 %s，AIS时间戳未推进，静默", now_s)
+        return
+
     if prev == "at_sea" and now_s == "in_port":
         msg = (
             f"⚓ <b>{VESSEL_NAME} 已返回{PORT_NAME}</b>\n\n"
@@ -356,7 +443,8 @@ def main():
         )
         log.info("🚢 出海 → 靠港，推送通知")
         send_telegram(msg)
-        state.update({"status": "in_port", "last_notify": now_str})
+        state.update({"status": "in_port", "last_notify": now_str,
+                      "last_ais_timestamp": pos.get("timestamp")})
 
     elif prev == "in_port" and now_s == "at_sea":
         msg = (
@@ -369,11 +457,15 @@ def main():
         )
         log.info("🌊 靠港 → 出海，推送通知")
         send_telegram(msg)
-        state.update({"status": "at_sea", "last_notify": now_str})
+        state.update({"status": "at_sea", "last_notify": now_str,
+                      "last_ais_timestamp": pos.get("timestamp")})
 
     else:
         log.info("状态无变化（%s），静默", now_s)
         state["status"] = now_s
+        # 即使不推送也更新时间戳记录，防止同一条数据在状态变化时才被消费
+        if pos.get("timestamp"):
+            state["last_ais_timestamp"] = pos.get("timestamp")
 
     state["last_update"] = now_str
     save_state(state)
