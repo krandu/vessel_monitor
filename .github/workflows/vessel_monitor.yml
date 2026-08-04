@@ -1,36 +1,45 @@
-name: 渔船靠港监控
+name: Vessel Monitor
 
 on:
   schedule:
-    - cron: '0 * * * *'   # 每小时检查一次（UTC），渔船靠港不需要分钟级精度
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:
-  check-vessel:
+  monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests websocket-client
 
-      - name: Check vessel position
+      - name: Restore vessel state
+        uses: actions/cache@v4
+        with:
+          path: vessel_state.json
+          key: vessel-state-${{ github.run_id }}
+          restore-keys: |
+            vessel-state-
+
+      - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
         run: python vessel_monitor.py
 
-      - name: Commit updated state
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add vessel_state.json
-          git diff --staged --quiet || git commit -m "chore: update vessel state [skip ci]"
-          git push
+      - name: Save vessel state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: vessel_state.json
+          key: vessel-state-${{ github.run_id }}
