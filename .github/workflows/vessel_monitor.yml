@@ -12,10 +12,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.3.0
         with:
           python-version: '3.11'
 
@@ -23,7 +23,7 @@ jobs:
         run: pip install requests websocket-client
 
       - name: Restore vessel state
-        uses: actions/cache@v4
+        uses: actions/cache@v4.2.0
         with:
           path: vessel_state.json
           key: vessel-state-${{ github.run_id }}
@@ -38,7 +38,7 @@ jobs:
         run: python vessel_monitor.py
 
       - name: Save vessel state
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v4.2.0
         if: always()
         with:
           path: vessel_state.json
