@@ -11,7 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       use_shipxy:
-        description: '是否使用船讯网 API'
+        description: '是否使用船讯网 API（消耗免费额度）'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      use_vesselapi:
+        description: '是否使用 vesselapi.com（测试该船是否有数据）'
         required: false
         default: 'true'
         type: choice
@@ -51,6 +57,7 @@ jobs:
           GITHUB_SCHEDULE: ${{ github.event.schedule }}
           GITHUB_EVENT: ${{ github.event_name }}
           MANUAL_USE_SHIPXY: ${{ github.event.inputs.use_shipxy }}
+          MANUAL_USE_VESSELAPI: ${{ github.event.inputs.use_vesselapi }}
         run: python vessel_monitor.py
 
       - name: Save vessel state
