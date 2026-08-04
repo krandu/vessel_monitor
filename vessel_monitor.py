@@ -35,20 +35,30 @@ STATE_FILE        = "vessel_state.json"
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-VESSELAPI_KEY     = os.environ.get("VESSELAPI_KEY", "")
-_SHIPXY_KEY_RAW   = os.environ.get("SHIPXY_API_KEY", "")   # 船讯网免费试用 key
+_VESSELAPI_KEY_RAW = os.environ.get("VESSELAPI_KEY", "")
+_SHIPXY_KEY_RAW    = os.environ.get("SHIPXY_API_KEY", "")  # 船讯网免费试用 key
 
-# 判断本次是否为船讯网调用时段（北京时间 08:00 / 14:00，对应 UTC 00:00 / 06:00）
+# 读取调度上下文
 _schedule   = os.environ.get("GITHUB_SCHEDULE", "")
 _event      = os.environ.get("GITHUB_EVENT", "")
-_manual_use = os.environ.get("MANUAL_USE_SHIPXY", "true")
+_is_local   = (_event == "")  # 本地直接运行
+_is_manual  = (_event == "workflow_dispatch")
+
+# 船讯网：仅在 08:00/14:00 定时或手动触发时启用
 _shipxy_schedules = {"0 0 * * 1-5", "0 6 * * 1-5"}
 _use_shipxy = (
-    _schedule in _shipxy_schedules                          # 定时：08:00/14:00
-    or (_event == "workflow_dispatch" and _manual_use != "false")  # 手动触发
-    or (_event == "" and _SHIPXY_KEY_RAW)                  # 本地直接运行
+    _schedule in _shipxy_schedules
+    or (_is_manual and os.environ.get("MANUAL_USE_SHIPXY", "true") != "false")
+    or _is_local
 )
 SHIPXY_KEY = _SHIPXY_KEY_RAW if _use_shipxy else ""
+
+# vesselapi：定时运行时始终启用；手动触发时根据选项决定
+_use_vesselapi = (
+    not _is_manual  # 定时/本地：始终启用
+    or os.environ.get("MANUAL_USE_VESSELAPI", "true") != "false"  # 手动：看选项
+)
+VESSELAPI_KEY = _VESSELAPI_KEY_RAW if _use_vesselapi else ""
 
 logging.basicConfig(
     level=logging.INFO,
