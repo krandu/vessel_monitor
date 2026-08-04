@@ -21,6 +21,7 @@
 ├── vessel_monitor.py        # 核心监控逻辑脚本
 ├── vessel_state.json        # 渔船状态记录文件（由脚本自动更新）
 └── README.md
+
 ⚙️ 配置说明
 在使用此项目前，需要配置 Telegram Bot 的凭据以接收推送。
 
