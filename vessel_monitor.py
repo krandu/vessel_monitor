@@ -36,7 +36,19 @@ STATE_FILE        = "vessel_state.json"
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 VESSELAPI_KEY     = os.environ.get("VESSELAPI_KEY", "")
-SHIPXY_KEY        = os.environ.get("SHIPXY_API_KEY", "")   # 船讯网免费试用 key
+_SHIPXY_KEY_RAW   = os.environ.get("SHIPXY_API_KEY", "")   # 船讯网免费试用 key
+
+# 判断本次是否为船讯网调用时段（北京时间 08:00 / 14:00，对应 UTC 00:00 / 06:00）
+_schedule   = os.environ.get("GITHUB_SCHEDULE", "")
+_event      = os.environ.get("GITHUB_EVENT", "")
+_manual_use = os.environ.get("MANUAL_USE_SHIPXY", "true")
+_shipxy_schedules = {"0 0 * * 1-5", "0 6 * * 1-5"}
+_use_shipxy = (
+    _schedule in _shipxy_schedules                          # 定时：08:00/14:00
+    or (_event == "workflow_dispatch" and _manual_use != "false")  # 手动触发
+    or (_event == "" and _SHIPXY_KEY_RAW)                  # 本地直接运行
+)
+SHIPXY_KEY = _SHIPXY_KEY_RAW if _use_shipxy else ""
 
 logging.basicConfig(
     level=logging.INFO,
