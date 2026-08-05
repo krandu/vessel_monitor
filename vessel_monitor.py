@@ -44,10 +44,9 @@ _event      = os.environ.get("GITHUB_EVENT", "")
 _is_local   = (_event == "")  # 本地直接运行
 _is_manual  = (_event == "workflow_dispatch")
 
-# 船讯网：仅在 08:00/14:00 定时或手动触发时启用
-_shipxy_schedules = {"0 0 * * 1-5", "0 6 * * 1-5"}
+# 船讯网：定时任务（两个时段均启用）、手动触发（看选项）、本地运行均启用
 _use_shipxy = (
-    _schedule in _shipxy_schedules
+    bool(_schedule)  # 所有定时触发均启用
     or (_is_manual and os.environ.get("MANUAL_USE_SHIPXY", "true") != "false")
     or _is_local
 )
