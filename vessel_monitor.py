@@ -10,8 +10,9 @@ MMSI: 412536814 | 目标港口: 洪湾渔港 (22.178°N, 113.437°E)
   2. shipinfo.net API / 网页（降级，接受 ≤ SHIPINFO_MAX_AGE_HOURS 的数据）
 
 防重推机制（方向A）:
-  shipinfo 延迟高达14+小时，用 last_ais_timestamp 记录上次推送时用的 AIS 时间戳，
-  只有时间戳比上次新才触发通知，避免同一条数据重复推送。
+  shipinfo 延迟高达14+小时，按数据源分别记录上次见到的 AIS 时间戳（last_ts_{source}），
+  只有当前时间戳比该源上次记录更新才触发通知，避免同一条数据重复推送。
+  不同数据源时间戳互相独立，不会互相干扰。
 
 vesselapi 调用策略:
   仅在需要时调用（shipinfo 也失败时），节省免费额度（150次/月）。
@@ -35,7 +36,6 @@ STATE_FILE        = "vessel_state.json"
 
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
-_VESSELAPI_KEY_RAW = os.environ.get("VESSELAPI_KEY", "")
 _SHIPXY_KEY_RAW    = os.environ.get("SHIPXY_API_KEY", "")  # 船讯网免费试用 key
 
 # 读取调度上下文
@@ -53,12 +53,6 @@ _use_shipxy = (
 )
 SHIPXY_KEY = _SHIPXY_KEY_RAW if _use_shipxy else ""
 
-# vesselapi：定时运行时始终启用；手动触发时根据选项决定
-_use_vesselapi = (
-    not _is_manual  # 定时/本地：始终启用
-    or os.environ.get("MANUAL_USE_VESSELAPI", "true") != "false"  # 手动：看选项
-)
-VESSELAPI_KEY = _VESSELAPI_KEY_RAW if _use_vesselapi else ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,22 +160,25 @@ def is_data_fresh(pos: dict) -> bool:
 
 def is_newer_than_last(pos: dict, state: dict) -> bool:
     """
-    方向A 防重推：检查当前数据的 AIS 时间戳是否比上次推送时更新。
-    shipinfo 延迟高，同一条数据可能在多次检查中都满足条件，
-    只有时间戳推进了才说明位置真的更新了，才允许触发通知。
-    返回 True 表示允许推送，False 表示时间戳未推进，跳过。
+    方向A 防重推：shipinfo 延迟高，同一条数据可能跨多次检查都满足条件。
+    按数据源分别记录上次见到的时间戳，只有当前时间戳比该源上次记录更新才允许触发。
+    实时数据源（shipxy）直接放行。
     """
-    # 实时数据源不需要时间戳去重检查
-    if pos.get("source") in ("vesselapi", "shipxy"):
+    source = pos.get("source", "")
+
+    # 实时数据源直接放行
+    if source == "shipxy":
         return True
 
     current_ts = parse_ais_timestamp(pos.get("timestamp"))
     if current_ts is None:
-        return True  # 没有时间戳，保守允许推送
+        return True  # 没有时间戳，保守允许
 
-    last_ts_raw = state.get("last_ais_timestamp")
+    # 按数据源分别存储时间戳，避免不同源之间互相干扰
+    key = f"last_ts_{source}"
+    last_ts_raw = state.get(key)
     if not last_ts_raw:
-        return True  # 首次没有记录，允许
+        return True  # 该源首次出现，允许
 
     last_ts = parse_ais_timestamp(last_ts_raw)
     if last_ts is None:
@@ -189,13 +186,15 @@ def is_newer_than_last(pos: dict, state: dict) -> bool:
 
     if current_ts <= last_ts:
         log.info(
-            "⏭️  shipinfo 数据时间戳未推进（当前: %s，上次推送: %s），跳过",
+            "⏭️  [%s] 时间戳未推进（当前: %s，上次: %s），跳过",
+            source,
             current_ts.strftime("%Y-%m-%d %H:%M"),
             last_ts.strftime("%Y-%m-%d %H:%M")
         )
         return False
 
-    log.info("🆕 时间戳推进: %s → %s",
+    log.info("🆕 [%s] 时间戳推进: %s → %s",
+             source,
              last_ts.strftime("%Y-%m-%d %H:%M"),
              current_ts.strftime("%Y-%m-%d %H:%M"))
     return True
@@ -252,57 +251,6 @@ def fetch_shipxy() -> dict | None:
 
     except Exception as e:
         log.warning("[shipxy] 异常: %s", e)
-        return None
-
-# ─── 数据源 1: vesselapi.com REST API（实时）────────────────────────────────
-def fetch_vesselapi() -> dict | None:
-    """
-    vesselapi.com 免费 REST API，按 MMSI 查询最新位置。
-    免费额度: 150次/月（仅在 shipinfo 失败时调用，实际用量远低于上限）
-    注册: https://dashboard.vesselapi.com（无需信用卡）
-    需要环境变量 VESSELAPI_KEY。
-    """
-    if not VESSELAPI_KEY:
-        log.info("[vesselapi] 未配置 VESSELAPI_KEY，跳过")
-        return None
-
-    url = f"https://api.vesselapi.com/v1/vessel/{MMSI}/position"
-    try:
-        r = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {VESSELAPI_KEY}"},
-            params={"filter.idType": "mmsi"},
-            timeout=15
-        )
-        log.info("[vesselapi] HTTP %s", r.status_code)
-
-        if r.status_code == 404:
-            log.warning("[vesselapi] 该船 MMSI 无近80小时内位置记录（船可能关闭AIS或超出覆盖范围）")
-            return None
-        if r.status_code == 429:
-            log.warning("[vesselapi] 请求频率超限（免费额度已用完？）")
-            return None
-        if r.status_code != 200:
-            log.warning("[vesselapi] 非预期状态码 %s，响应: %s", r.status_code, r.text[:300])
-            return None
-
-        data = r.json()
-        # 响应字段: latitude, longitude, sog, timestamp (ISO UTC), vessel_name
-        lat = data.get("latitude")
-        lon = data.get("longitude")
-        spd = data.get("sog") or 0
-        ts  = data.get("timestamp")   # "2026-01-15T12:30:00Z" 格式
-
-        if lat is None or lon is None:
-            log.warning("[vesselapi] 响应中无坐标，完整响应: %s", json.dumps(data)[:500])
-            return None
-
-        log.info("[vesselapi] lat=%.5f lon=%.5f spd=%.1f ts=%s", lat, lon, spd, ts)
-        return {"lat": float(lat), "lon": float(lon), "speed": float(spd),
-                "timestamp": ts, "source": "vesselapi"}
-
-    except Exception as e:
-        log.warning("[vesselapi] 异常: %s", e)
         return None
 
 # ─── 数据源 2: shipinfo.net API ───────────────────────────────────────────────
@@ -397,7 +345,6 @@ def fetch_shipinfo_web() -> dict | None:
 # ─── 主逻辑 ───────────────────────────────────────────────────────────────────
 SOURCES = [
     ("shipxy",       fetch_shipxy),       # 第一：船讯网，中国近海覆盖最佳
-    ("vesselapi",    fetch_vesselapi),    # 第二：vesselapi，国际平台
     ("shipinfo_api", fetch_shipinfo_api), # 第三：shipinfo API（允许20h延迟）
     ("shipinfo_web", fetch_shipinfo_web), # 第四：shipinfo 网页（兜底）
 ]
@@ -434,7 +381,7 @@ def main():
     log.info("=" * 60)
     log.info("开始监控 %s (MMSI: %s)", VESSEL_NAME, MMSI)
     log.info("运行时间: %s", now_str)
-    log.info("shipinfo最大接受延迟: %dh | vesselapi: %s", SHIPINFO_MAX_AGE_HOURS, "已配置" if VESSELAPI_KEY else "未配置")
+    log.info("shipinfo最大接受延迟: %dh", SHIPINFO_MAX_AGE_HOURS)
     log.info("=" * 60)
 
     pos = get_vessel_position()
@@ -450,7 +397,7 @@ def main():
             send_telegram(
                 f"⚠️ <b>{VESSEL_NAME}</b> 数据异常\n"
                 f"已连续 {fail_count} 小时无法获取有效位置数据\n"
-                f"（所有数据源失败或数据超过 {MAX_DATA_AGE_HOURS} 小时）\n"
+                f"（所有数据源失败或数据超过 {SHIPINFO_MAX_AGE_HOURS} 小时）\n"
                 f"🕐 {now_str}"
             )
         return
@@ -497,8 +444,9 @@ def main():
         )
         log.info("🚢 出海 → 靠港，推送通知")
         send_telegram(msg)
-        state.update({"status": "in_port", "last_notify": now_str,
-                      "last_ais_timestamp": pos.get("timestamp")})
+        state.update({"status": "in_port", "last_notify": now_str})
+        if pos.get("timestamp"):
+            state[f"last_ts_{pos['source']}"] = pos.get("timestamp")
 
     elif prev == "in_port" and now_s == "at_sea":
         msg = (
@@ -511,15 +459,16 @@ def main():
         )
         log.info("🌊 靠港 → 出海，推送通知")
         send_telegram(msg)
-        state.update({"status": "at_sea", "last_notify": now_str,
-                      "last_ais_timestamp": pos.get("timestamp")})
+        state.update({"status": "at_sea", "last_notify": now_str})
+        if pos.get("timestamp"):
+            state[f"last_ts_{pos['source']}"] = pos.get("timestamp")
 
     else:
         log.info("状态无变化（%s），静默", now_s)
         state["status"] = now_s
-        # 即使不推送也更新时间戳记录，防止同一条数据在状态变化时才被消费
+        # 即使不推送也更新时间戳记录
         if pos.get("timestamp"):
-            state["last_ais_timestamp"] = pos.get("timestamp")
+            state[f"last_ts_{pos['source']}"] = pos.get("timestamp")
 
     state["last_update"] = now_str
     save_state(state)
